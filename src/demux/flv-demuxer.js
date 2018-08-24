@@ -19,6 +19,7 @@
 import Log from '../utils/logger.js';
 import AMF from './amf-parser.js';
 import SPSParser from './sps-parser.js';
+import HEVCSpsParser from './sps-parser-hevc.js';
 import DemuxErrors from './demux-errors.js';
 import MediaInfo from '../core/media-info.js';
 import {IllegalStateException} from '../utils/exception.js';
@@ -821,7 +822,10 @@ class FLVDemuxer {
         let frameType = (spec & 240) >>> 4;
         let codecId = spec & 15;
 
-        if (codecId !== 7) {
+        if (codecId == 12) {
+            this._parseHEVCVideoPacket(arrayBuffer, dataOffset + 1, dataSize - 1, tagTimestamp, tagPosition, frameType);
+            return;
+        } else if (codecId !== 7) {
             this._onError(DemuxErrors.CODEC_UNSUPPORTED, `Flv: Unsupported codec in video frame: ${codecId}`);
             return;
         }
@@ -1080,6 +1084,130 @@ class FLVDemuxer {
         }
     }
 
+    _parseHEVCVideoPacket(arrayBuffer, dataOffset, dataSize, tagTimestamp, tagPosition, frameType) {
+        if (dataSize < 4) {
+            Log.w(this.TAG, 'Flv: Invalid HEVC packet, missing HEVCPacketType or/and CompositionTime');
+            return;
+        }
+
+        let le = this._littleEndian;
+        let v = new DataView(arrayBuffer, dataOffset, dataSize);
+
+        let packetType = v.getUint8(0);
+        let cts_unsigned = v.getUint32(0, !le) & 0x00FFFFFF;
+        let cts = (cts_unsigned << 8) >> 8;  // convert to 24-bit signed int
+
+        if (packetType === 0) {  // HEVCDecoderConfigurationRecord
+            this._parseHEVCDecoderConfigurationRecord(arrayBuffer, dataOffset + 4, dataSize - 4);
+        } else if (packetType === 1) {  // One or more Nalus
+            this._parseAVCVideoData(arrayBuffer, dataOffset + 4, dataSize - 4, tagTimestamp, tagPosition, frameType, cts);
+        } else if (packetType === 2) {
+            // empty, HEVC end of sequence
+        } else {
+            this._onError(DemuxErrors.FORMAT_ERROR, `Flv: Invalid video packet type ${packetType}`);
+            return;
+        }
+    }
+
+    _parseHEVCDecoderConfigurationRecord(arrayBuffer, dataOffset, dataSize) {
+        if (dataSize < 23) {
+            Log.w(this.TAG, 'Flv: Invalid HEVCDecoderConfigurationRecord, lack of data!');
+            return;
+        }
+
+        let meta = this._videoMetadata;
+        let track = this._videoTrack;
+        let le = this._littleEndian;
+        let v = new DataView(arrayBuffer, dataOffset, dataSize);
+
+        if (!meta) {
+            if (this._hasVideo === false && this._hasVideoFlagOverrided === false) {
+                this._hasVideo = true;
+                this._mediaInfo.hasVideo = true;
+            }
+
+            meta = this._videoMetadata = {};
+            meta.type = 'video';
+            meta.id = track.id;
+            meta.timescale = 1000;
+            meta.duration = 100000;
+        } else {
+            if (typeof meta.avcc !== 'undefined') {
+                Log.w(this.TAG, 'Found another HEVCDecoderConfigurationRecord!');
+            }
+        }
+
+        this._naluLengthSize = (v.getUint8(21) & 3) + 1;  // lengthSizeMinusOne
+        if (this._naluLengthSize !== 3 && this._naluLengthSize !== 4) {  // holy shit!!!
+            this._onError(DemuxErrors.FORMAT_ERROR, `Flv: Strange NaluLengthSizeMinusOne: ${this._naluLengthSize - 1}`);
+            return;
+        }
+
+        let numArrays = v.getUint8(22);
+        let offset = 23;
+        for (let i = 0; i < numArrays; i++) {
+            let type = (v.getUint8(offset) & 0x3f);
+            offset += 1;
+            let count = v.getUint16(offset, !le);
+            offset += 2;
+
+            for (let j = 0; j < count; j++) {
+                let nalsize = v.getUint16(offset, !le) + 2;
+
+                if (type == 32) { //vps
+                } else if (type == 33) { //sps
+                    let sps = new Uint8Array(arrayBuffer, dataOffset + offset + 4, nalsize - 4);
+                    let parser = new HEVCSpsParser(sps);
+                    let config = parser.readSPSHEVC();
+
+                    meta.codecWidth = config.width;
+                    meta.codecHeight = config.height;
+
+                    meta.bitDepth = config.bitDepthLuma;
+                    meta.chromaFormat = config.chromaFormat;
+
+                    meta.type = 'video';
+                    meta.codec = config.codecId;
+
+                    let mi = this._mediaInfo;
+                    mi.width = meta.codecWidth;
+                    mi.height = meta.codecHeight;
+                    mi.chromaFormat = config.chromaFormatString;
+                    mi.videoCodec = meta.codec;
+
+                    if (mi.hasAudio) {
+                        if (mi.audioCodec != null) {
+                            mi.mimeType = 'video/x-flv; codecs="' + mi.videoCodec + ',' + mi.audioCodec + '"';
+                        }
+                    } else {
+                        mi.mimeType = 'video/x-flv; codecs="' + mi.videoCodec + '"';
+                    }
+                    if (mi.isComplete()) {
+                        this._onMediaInfo(mi);
+                    }
+                } else if (type == 34) { //pps
+                }
+
+                offset += nalsize;
+            }
+        }
+
+        meta.hvcc = new Uint8Array(dataSize);
+        meta.hvcc.set(new Uint8Array(arrayBuffer, dataOffset, dataSize), 0);
+        Log.v(this.TAG, 'Parsed AVCDecoderConfigurationRecord');
+
+        if (this._isInitialMetadataDispatched()) {
+            // flush parsed frames
+            if (this._dispatch && (this._audioTrack.length || this._videoTrack.length)) {
+                this._onDataAvailable(this._audioTrack, this._videoTrack);
+            }
+        } else {
+            this._videoInitialMetadataDispatched = true;
+        }
+        // notify new metadata
+        this._dispatch = false;
+        this._onTrackMetadata('video', meta);
+    }
 }
 
 export default FLVDemuxer;
